@@ -1,6 +1,5 @@
 // For some reason ts-node cannot see the global fetch, so I use this in place
-import fetch from 'node-fetch';
-
+import fetch from 'isomorphic-fetch';
 const API_KEY = 'b6913686ac08f3e7bc5e90869371';
 
 interface PageVisitEvent {
@@ -20,7 +19,7 @@ interface Input {
 }
 
 interface Output {
-  sessionByUser: Record<PageVisitEvent['visitorId'], Session[]>;
+  sessionsByUser: Record<PageVisitEvent['visitorId'], Session[]>;
 }
 
 const getData = async () => {
@@ -29,27 +28,17 @@ const getData = async () => {
   return json;
 };
 
-const postData = async (result: object) => {
-  try {
-    const res = await fetch(`https://candidate.hubteam.com/candidateTest/v3/problem/result?userKey=${API_KEY}`, {
-      method: 'POST',
-      body: JSON.stringify(result),
-    });
-    if (res.status === 200) return true;
-    return false;
-  } catch (err) {
-    console.error(err);
-    return false;
-  }
-};
+const postData = async (result: Output) => {
+  const res = await fetch(`https://candidate.hubteam.com/candidateTest/v3/problem/result?userKey=${API_KEY}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(result),
+  });
 
-const compare = (a: PageVisitEvent, b: PageVisitEvent) => {
-  let timestampA = a.timestamp;
-  let timestampB = b.timestamp;
-
-  if (timestampA > timestampB) return 1;
-  if (timestampA < timestampB) return -1;
-  return 0;
+  if (res.status === 200) return true;
+  return false;
 };
 
 const buildSession = (input: Input): Output => {
@@ -61,18 +50,28 @@ const buildSession = (input: Input): Output => {
   // - increases the duration by the difference between the previous event and current event
   // - add the page into the page list
 
-  // step 1: group events by visitor
-  const TEN_MINUTES = 10 * 60 * 1000;
-  const groupedByVisitor = input.events.reduce((acc, next) => {
-    acc.set(next.visitorId, (acc.get(next.visitorId) ?? []).concat(next));
-    return acc;
-  }, new Map() as Map<PageVisitEvent['visitorId'], PageVisitEvent[]>);
+  const compare = (a: PageVisitEvent, b: PageVisitEvent) => {
+    let timestampA = a.timestamp;
+    let timestampB = b.timestamp;
 
-  // step 2: fold into group
-  const result: Record<PageVisitEvent['visitorId'], Session[]> = {};
+    if (timestampA > timestampB) return 1;
+    if (timestampA < timestampB) return -1;
+    return 0;
+  };
 
-  for (let [visitorId, events] of groupedByVisitor.entries()) {
+  const eventsToSession = (events: PageVisitEvent[]): Session => {
+    const [first, last] = [events[0], events[events.length - 1]];
+
+    return {
+      duration: last.timestamp - first.timestamp,
+      pages: events.map(e => e.url),
+      startTime: first.timestamp,
+    };
+  };
+
+  const groupEvents = (events: PageVisitEvent[]): Session[] => {
     events.sort(compare);
+
     const groups: Session[] = [];
     let buffer: PageVisitEvent[] = [];
 
@@ -82,12 +81,7 @@ const buildSession = (input: Input): Output => {
         const lastInBuffer = buffer[buffer.length - 1];
         if (event.timestamp - lastInBuffer.timestamp > TEN_MINUTES) {
           // groups events in buffer into a session
-          const newSession = {
-            duration: lastInBuffer.timestamp - buffer[0].timestamp,
-            pages: buffer.map(e => e.url),
-            startTime: buffer[0].timestamp,
-          };
-          groups.push(newSession);
+          groups.push(eventsToSession(buffer));
           buffer = [event];
         } else {
           buffer.push(event);
@@ -96,17 +90,29 @@ const buildSession = (input: Input): Output => {
     }
     // buffer flusing at the end
     if (buffer.length) {
-      groups.push({
-        duration: buffer[buffer.length - 1].timestamp - buffer[0].timestamp,
-        pages: buffer.map(e => e.url),
-        startTime: buffer[0].timestamp,
-      });
+      groups.push(eventsToSession(buffer));
     }
 
+    return groups;
+  };
+
+  // step 1: group events by visitor
+  const TEN_MINUTES = 10 * 60 * 1000;
+
+  const groupedByVisitor = input.events.reduce((acc, next) => {
+    acc.set(next.visitorId, (acc.get(next.visitorId) || []).concat(next));
+    return acc;
+  }, new Map() as Map<PageVisitEvent['visitorId'], PageVisitEvent[]>);
+
+  // step 2: fold into group
+  const result: Record<PageVisitEvent['visitorId'], Session[]> = {};
+
+  for (let [visitorId, events] of groupedByVisitor.entries()) {
+    const groups = groupEvents(events);
     result[visitorId] = groups;
   }
 
-  return { sessionByUser: result };
+  return { sessionsByUser: result };
 };
 
 async function main() {
@@ -115,10 +121,12 @@ async function main() {
     const output = buildSession(input);
 
     const result = await postData(output);
+
     if (result) {
       console.log('Code accepted!');
     } else {
-      console.log('Code was rejected. Output was', output);
+      console.log('Code was rejected.');
+      console.log('Output was', JSON.stringify(output, null, 4));
     }
   } catch (err) {
     console.error('Some error happened', err);
